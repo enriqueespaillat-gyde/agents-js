@@ -1,12 +1,10 @@
 // SPDX-FileCopyrightText: 2026 LiveKit, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import type { TypedEventEmitter } from '@livekit/typed-emitter';
 import EventEmitter from 'events';
 import { log } from '../../log.js';
 import type { InterruptionMetrics } from '../../metrics/base.js';
-import { asError } from '../../utils.js';
 import { DEFAULT_INFERENCE_URL, STAGING_INFERENCE_URL, getDefaultInferenceUrl } from '../utils.js';
 import { FRAMES_PER_SECOND, SAMPLE_RATE, interruptionOptionDefaults } from './defaults.js';
 import { InterruptionDetectionError } from './errors.js';
@@ -167,7 +165,7 @@ export class AdaptiveInterruptionDetector extends (EventEmitter as new () => Typ
       this.streams.add(streamBase);
       return streamBase;
     } catch (e) {
-      const cause = asError(e);
+      const cause = e instanceof Error ? e : new Error(String(e));
       this.emitError(new InterruptionDetectionError(cause.message, Date.now(), this._label, false));
       throw e;
     }
@@ -201,6 +199,6 @@ export class AdaptiveInterruptionDetector extends (EventEmitter as new () => Typ
     for (const stream of this.streams) {
       updatePromises.push(stream.updateOptions(options));
     }
-    await ThrowsPromise.all(updatePromises);
+    await Promise.all(updatePromises);
   }
 }

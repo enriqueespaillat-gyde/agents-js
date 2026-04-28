@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Mutex } from '@livekit/mutex';
 import type { AudioFrame, Room } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import type { TypedEventEmitter as TypedEmitter } from '@livekit/typed-emitter';
 import type { Context, Span } from '@opentelemetry/api';
 import { ROOT_CONTEXT, context as otelContext, trace } from '@opentelemetry/api';
@@ -20,7 +19,7 @@ import {
 } from '../inference/index.js';
 import type { InterruptionDetectionError } from '../inference/interruption/errors.js';
 import type { OverlappingSpeechEvent } from '../inference/interruption/types.js';
-import { getJobContext } from '../job.js';
+import { type JobContext, getJobContext } from '../job.js';
 import type { FunctionCall, FunctionCallOutput } from '../llm/chat_context.js';
 import { AgentHandoffItem, ChatContext, ChatMessage } from '../llm/chat_context.js';
 import type { LLM, RealtimeModel, RealtimeModelError, ToolChoice } from '../llm/index.js';
@@ -37,14 +36,13 @@ import {
   type ResolvedSessionConnectOptions,
   type SessionConnectOptions,
 } from '../types.js';
-import { Task, asError } from '../utils.js';
+import { Event, Task } from '../utils.js';
 import type { VAD } from '../vad.js';
 import type { Agent } from './agent.js';
 import {
   AgentActivity,
   type ReusableResources,
   cleanupReusableResources,
-  isSchedulingPausedError,
 } from './agent_activity.js';
 import type { _TurnDetector } from './audio_recognition.js';
 import {
@@ -103,6 +101,7 @@ export interface InternalSessionOptions<UserData> extends AgentSessionOptions<Us
 
 export const defaultAgentSessionOptions = {
   maxToolSteps: 3,
+  preemptiveGeneration: true,
   userAwayTimeout: 15.0,
   aecWarmupDuration: 3000,
   turnHandling: {},
@@ -112,8 +111,7 @@ export const defaultAgentSessionOptions = {
 /** @deprecated {@link VoiceOptions} has been flattened onto to {@link AgentSessionOptions} */
 export type VoiceOptions = {
   maxToolSteps: number;
-  /** @deprecated Use {@link AgentSessionOptions.turnHandling}.preemptiveGeneration instead. */
-  preemptiveGeneration?: boolean;
+  preemptiveGeneration: boolean;
   userAwayTimeout?: number | null;
   /** @deprecated Use {@link AgentSessionOptions.turnHandling}.interruption.mode instead. */
   allowInterruptions?: boolean;
@@ -160,8 +158,12 @@ export type AgentSessionOptions<UserData = UnknownUserData> = {
 
   maxToolSteps?: number;
   /**
-   * @deprecated Use `turnHandling.preemptiveGeneration` instead.
-   * When set, migrated into `turnHandling.preemptiveGeneration.enabled`.
+   * Whether to speculatively begin LLM and TTS requests before an end-of-turn is detected.
+   * When `true`, the agent sends inference calls as soon as a user transcript is received rather
+   * than waiting for a definitive turn boundary. This can reduce response latency by overlapping
+   * model inference with user audio, but may incur extra compute if the user interrupts or
+   * revises mid-utterance.
+   * @defaultValue true
    */
   preemptiveGeneration?: boolean;
 
@@ -272,6 +274,11 @@ export class AgentSession<
 
   /** @internal */
   _userSpeakingSpan?: Span;
+
+  /** @internal - true while run() setup is in flight */
+  _runStartInFlight = false;
+
+  private _activityChanged = new Event();
 
   private logger = log();
 
@@ -443,7 +450,12 @@ export class AgentSession<
       }
     }
 
-    const ctx = getJobContext(false);
+    let ctx: JobContext | undefined = undefined;
+    try {
+      ctx = getJobContext();
+    } catch {
+      // JobContext is not available in evals
+    }
 
     if (ctx) {
       if (room && ctx.room === room && !room.isConnected) {
@@ -476,7 +488,7 @@ export class AgentSession<
     // Initial start does not wait on onEnter
     tasks.push(this._updateActivity(this.agent, { waitOnEnter: false }));
 
-    await ThrowsPromise.allSettled(tasks);
+    await Promise.allSettled(tasks);
 
     if (this.sessionHost) {
       await this.sessionHost.start();
@@ -516,9 +528,10 @@ export class AgentSession<
     this.closing = false;
     this._usageCollector = new ModelUsageCollector();
 
-    const ctx = getJobContext(false);
+    let ctx: JobContext | undefined = undefined;
+    try {
+      ctx = getJobContext();
 
-    if (ctx) {
       if (record === undefined) {
         record = ctx.job.enableRecording;
       }
@@ -528,6 +541,9 @@ export class AgentSession<
       if (this._enableRecording) {
         ctx.initRecording();
       }
+    } catch (error) {
+      // JobContext is not available in evals
+      this.logger.warn('JobContext is not available');
     }
 
     this.sessionSpan = tracer.startSpan({
@@ -645,22 +661,6 @@ export class AgentSession<
     return this.activity.interrupt(options);
   }
 
-  pauseReplyAuthorization(): void {
-    if (!this.activity) {
-      throw new Error('AgentSession is not running');
-    }
-
-    this.activity.pauseReplyAuthorization();
-  }
-
-  resumeReplyAuthorization(): void {
-    if (!this.activity) {
-      throw new Error('AgentSession is not running');
-    }
-
-    this.activity.resumeReplyAuthorization();
-  }
-
   generateReply(options?: {
     userInput?: string | ChatMessage;
     chatCtx?: ChatContext;
@@ -689,22 +689,7 @@ export class AgentSession<
         }
         return nextActivity.generateReply({ userMessage, ...options });
       }
-
-      // Handoff can race with scheduling pause between the check above and generateReply().
-      // If that happens, retry on the next activity instead of surfacing an avoidable error.
-      try {
-        return activity.generateReply({ userMessage, ...options });
-      } catch (error) {
-        const canFallback = nextActivity !== undefined && isSchedulingPausedError(error);
-        if (!canFallback) {
-          throw error;
-        }
-        this.logger.debug(
-          { error },
-          'generateReply scheduling raced with handoff drain; retrying on next activity',
-        );
-        return nextActivity.generateReply({ userMessage, ...options });
-      }
+      return activity.generateReply({ userMessage, ...options });
     };
 
     // attach to the session span if called outside of the AgentSession
@@ -723,6 +708,64 @@ export class AgentSession<
     }
 
     return handle;
+  }
+
+  /**
+   * @internal
+   * Wait for all in-flight activity transitions to complete.
+   *
+   * _updateActivity holds the activityLock for its critical section, then
+   * releases it before awaiting onEnter.  If onEnter triggers a nested
+   * _updateActivity (e.g. Agent → TaskGroup → AgentTask),
+   * each nested call queues behind the lock in FIFO order.
+   *
+   * A single lock acquire only waits for the *next* holder — not the full
+   * chain.  So we loop: snapshot the current agent, acquire+release the lock
+   * (which blocks until the next queued _updateActivity finishes its critical
+   * section), then check whether the agent changed.  If it did, another
+   * transition ran, so we loop again.  When two consecutive iterations see
+   * the same agent, the chain has settled.
+   */
+  async _drainActivityLock(): Promise<void> {
+    let prevActivity: AgentActivity | undefined;
+    do {
+      prevActivity = this.activity;
+      (await this.activityLock.lock())();
+    } while (this.activity !== prevActivity);
+  }
+
+  private _notifyActivityChanged(): void {
+    this._activityChanged.set();
+  }
+
+  /** @internal */
+  _trackRunHandle(handle: SpeechHandle | Task<void>): void {
+    if (this._globalRunState && !this._globalRunState.done()) {
+      this._globalRunState._watchHandle(handle);
+    }
+  }
+
+  /**
+   * Wait for the current activity to be ready to accept input.
+   *
+   * After _drainActivityLock, the final activity is normally already started
+   * with schedulingPaused=false. This loop handles edge cases where a
+   * transition is still settling.
+   */
+  private async waitForRunReadyActivity(): Promise<void> {
+    while (this.activity?.schedulingPaused) {
+      if (this.closing) {
+        throw new Error('AgentSession is closing, cannot use generateReply()');
+      }
+
+      this._activityChanged.clear();
+      if (!this.activity?.schedulingPaused) break;
+      await this._activityChanged.wait();
+    }
+
+    if (!this.activity || this.closing) {
+      throw new Error('AgentSession is closing, cannot use generateReply()');
+    }
   }
 
   /**
@@ -748,7 +791,7 @@ export class AgentSession<
     userInput: string;
     outputType?: z.ZodType<T>;
   }): RunResult<T> {
-    if (this._globalRunState && !this._globalRunState.done()) {
+    if (this._runStartInFlight || (this._globalRunState && !this._globalRunState.done())) {
       throw new Error('nested runs are not supported');
     }
 
@@ -757,21 +800,26 @@ export class AgentSession<
       outputType,
     });
 
-    this._globalRunState = runState;
+    this._runStartInFlight = true;
 
-    // Defer generateReply through the activityLock to ensure any in-progress
-    // activity transition (e.g. AgentTask started from onEnter) completes first.
-    // TS Task.from starts onEnter synchronously, so the transition may already be
-    // mid-flight by the time run() is called after session.start() resolves.
-    // Acquiring and immediately releasing the lock guarantees FIFO ordering:
-    // the transition's lock section finishes before we route generateReply.
     (async () => {
       try {
-        const unlock = await this.activityLock.lock();
-        unlock();
+        // Drain the activity lock until no more transitions are queued.
+        // Each nested _updateActivity from the bootstrap chain (e.g.
+        // Agent → TaskGroup → AgentTask) acquires and
+        // releases the lock in FIFO order. We keep re-acquiring until the
+        // activity stabilizes (no change between two consecutive acquisitions).
+        await this._drainActivityLock();
+        await this.waitForRunReadyActivity();
+
+        this._globalRunState = runState;
+        this._runStartInFlight = false;
+
+        runState._setMinCreatedAt(Date.now());
         this.generateReply({ userInput });
       } catch (e) {
-        runState._reject(asError(e));
+        this._runStartInFlight = false;
+        runState._reject(e instanceof Error ? e : new Error(String(e)));
       }
     })();
 
@@ -829,7 +877,7 @@ export class AgentSession<
             'Session is closing, skipping start of next activity',
           );
           if (reusableResources) {
-            await cleanupReusableResources(reusableResources, this.logger);
+            await cleanupReusableResources(reusableResources);
             reusableResources = undefined;
           }
           this.nextActivity = undefined;
@@ -865,6 +913,41 @@ export class AgentSession<
         } else {
           await this.activity!.resume({ reuseResources: reusableResources });
         }
+
+        // Notify AFTER start/resume so waiters see schedulingPaused=false.
+        this._notifyActivityChanged();
+
+        // For resumed activities whose onEnter is still running (e.g. a
+        // TaskGroup loop advancing to the next child), track a handle that
+        // waits for the child transition then drains the cascade. Only for
+        // 'resume' — freshly started activities haven't triggered cascading
+        // transitions yet. Registered AFTER notify so it waits for the
+        // subsequent transition, not this one.
+        if (
+          newActivity === 'resume' &&
+          this._globalRunState &&
+          !this._globalRunState.done() &&
+          this.activity?._onEnterTask &&
+          !this.activity._onEnterTask.done
+        ) {
+          this._activityChanged.clear();
+          const onEnterDone = this.activity._onEnterTask.result.then(
+            () => {},
+            () => {},
+          );
+          const settleTask = Task.from(
+            async () => {
+              // Race: either the next transition fires, or onEnter finishes
+              // without triggering one (e.g. last task in the group).
+              await Promise.race([this._activityChanged.wait(), onEnterDone]);
+              await this._drainActivityLock();
+            },
+            undefined,
+            'activity_settleWait',
+          );
+          this._trackRunHandle(settleTask);
+        }
+
         reusableResources = undefined;
 
         onEnterTask = this.activity!._onEnterTask;
@@ -876,7 +959,7 @@ export class AgentSession<
         // JS safeguard: session cleanup owns the detached resources until the next activity
         // starts successfully, preventing leaks when handoff fails mid-transition.
         if (reusableResources) {
-          await cleanupReusableResources(reusableResources, this.logger);
+          await cleanupReusableResources(reusableResources);
         }
         throw error;
       } finally {

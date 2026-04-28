@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import { MultiMutex, Mutex } from '@livekit/mutex';
-import { type Throws, ThrowsPromise } from '@livekit/throws-transformer/throws';
+import type { Throws } from '@livekit/throws-transformer/throws';
 import type { RunningJobInfo } from '../job.js';
 import { Queue } from '../utils.js';
 import type { InferenceExecutor } from './inference_executor.js';
@@ -97,7 +97,6 @@ export class ProcPool {
       this.executors.push(proc);
 
       const unlock = await this.initMutex.lock();
-      let initReleased = false;
       let procUnlockTransferred = false;
       try {
         if (this.closed) {
@@ -109,19 +108,13 @@ export class ProcPool {
           await proc.initialize();
           await this.warmedProcQueue.put({ proc, unlock: procUnlock });
           procUnlockTransferred = true;
-          // Release initMutex after enqueue — holding it through join() serialises
-          // the pool to concurrency 1 since child procs are one-shot.
-          unlock();
-          initReleased = true;
         } catch {
           // Initialization failed before enqueue, so release the acquired slot immediately.
         }
 
         await proc.join();
       } finally {
-        if (!initReleased) {
-          unlock();
-        }
+        unlock();
         if (!procUnlockTransferred) {
           procUnlock();
         }
@@ -174,6 +167,6 @@ export class ProcPool {
       e.proc.close();
     });
     this.executors.forEach((e) => e.close());
-    await ThrowsPromise.allSettled(this.tasks);
+    await Promise.allSettled(this.tasks);
   }
 }

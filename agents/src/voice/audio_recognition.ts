@@ -4,7 +4,6 @@
 import { Mutex } from '@livekit/mutex';
 import type { ParticipantKind } from '@livekit/rtc-node';
 import { AudioFrame } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import {
   type Context,
   ROOT_CONTEXT,
@@ -13,7 +12,7 @@ import {
   trace,
 } from '@opentelemetry/api';
 import type { WritableStreamDefaultWriter } from 'node:stream/web';
-import type { ReadableStream } from 'node:stream/web';
+import { ReadableStream } from 'node:stream/web';
 import { isAPIError } from '../_exceptions.js';
 import { apiConnectDefaults, intervalForRetry } from '../inference/interruption/defaults.js';
 import { InterruptionDetectionError } from '../inference/interruption/errors.js';
@@ -56,8 +55,6 @@ export interface EndOfTurnInfo {
 export interface PreemptiveGenerationInfo {
   newTranscript: string;
   transcriptConfidence: number;
-  /** Timestamp when user started speaking (milliseconds since epoch), if known. */
-  startedSpeakingAt: number | undefined;
 }
 
 export interface RecognitionHooks {
@@ -626,7 +623,6 @@ export class AudioRecognition {
                   ? this.finalTranscriptConfidence.reduce((a, b) => a + b, 0) /
                     this.finalTranscriptConfidence.length
                   : 0,
-              startedSpeakingAt: this.speechStartTime,
             });
           }
 
@@ -692,7 +688,6 @@ export class AudioRecognition {
               confidenceVals.length > 0
                 ? confidenceVals.reduce((a, b) => a + b, 0) / confidenceVals.length
                 : 0,
-            startedSpeakingAt: this.speechStartTime,
           });
         }
         break;
@@ -1113,7 +1108,7 @@ export class AudioRecognition {
 
           try {
             while (!signal.aborted) {
-              const res = await ThrowsPromise.race([inputReader.read(), abortPromise]);
+              const res = await Promise.race([inputReader.read(), abortPromise]);
               if (!res) break;
 
               const { value, done } = res;
@@ -1136,7 +1131,7 @@ export class AudioRecognition {
         const abortPromise = waitForAbort(signal);
 
         while (!signal.aborted) {
-          const res = await ThrowsPromise.race([eventReader.read(), abortPromise]);
+          const res = await Promise.race([eventReader.read(), abortPromise]);
           if (!res) break;
           const { done, value: ev } = res;
           if (done) break;

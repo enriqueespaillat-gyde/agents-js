@@ -333,11 +333,7 @@ export class ParticipantAudioOutput extends AudioOutput {
     super(options.sampleRate, undefined, { pause: true });
     this.room = room;
     this.options = options;
-    this.audioSource = new AudioSource(
-      options.sampleRate,
-      options.numChannels,
-      options.queueSizeMs,
-    );
+    this.audioSource = new AudioSource(options.sampleRate, options.numChannels);
   }
 
   get subscribed(): boolean {

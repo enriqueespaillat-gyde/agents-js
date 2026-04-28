@@ -2,12 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import type { AudioFrame } from '@livekit/rtc-node';
-import type { ReadableStream } from 'node:stream/web';
 import { describe, expect, it, vi } from 'vitest';
 import { ChatContext } from '../llm/chat_context.js';
 import { type RealtimeCapabilities, RealtimeModel, type RealtimeSession } from '../llm/realtime.js';
 import type { SpeechEvent } from '../stt/stt.js';
-import { Agent, type ModelSettings } from './agent.js';
+import { Agent } from './agent.js';
 import {
   AgentActivity,
   type ReusableResources,
@@ -43,13 +42,10 @@ async function detachResources(
   oldActivity: FakeActivity,
   newActivity: FakeActivity,
 ): Promise<ReusableResources> {
-  // Access private method via prototype for testing
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const fn = (AgentActivity.prototype as any)._detachReusableResources as (
-    this: FakeActivity,
-    newActivity: FakeActivity,
-  ) => Promise<ReusableResources>;
-  return await fn.call(oldActivity, newActivity);
+  return await (AgentActivity.prototype as any)._detachReusableResources.call(
+    oldActivity,
+    newActivity,
+  );
 }
 
 describe('AgentActivity STT handoff reuse eligibility', () => {
@@ -89,13 +85,13 @@ describe('AgentActivity STT handoff reuse eligibility', () => {
     const sharedStt = { id: 'shared-stt' };
 
     class AgentA extends Agent {
-      async sttNode(_audio: ReadableStream<AudioFrame>, _modelSettings: ModelSettings) {
+      async sttNode(_audio: ReadableStream<AudioFrame>, _modelSettings: any) {
         return null as ReadableStream<SpeechEvent | string> | null;
       }
     }
 
     class AgentB extends Agent {
-      async sttNode(_audio: ReadableStream<AudioFrame>, _modelSettings: ModelSettings) {
+      async sttNode(_audio: ReadableStream<AudioFrame>, _modelSettings: any) {
         return null as ReadableStream<SpeechEvent | string> | null;
       }
     }
@@ -113,7 +109,7 @@ describe('AgentActivity STT handoff reuse eligibility', () => {
     const sharedStt = { id: 'shared-stt' };
 
     class AgentA extends Agent {
-      async sttNode(_audio: ReadableStream<AudioFrame>, _modelSettings: ModelSettings) {
+      async sttNode(_audio: ReadableStream<AudioFrame>, _modelSettings: any) {
         return null as ReadableStream<SpeechEvent | string> | null;
       }
     }
@@ -171,7 +167,7 @@ describe('AgentActivity RT session reuse eligibility', () => {
       autoToolReplyGeneration: false,
       audioOutput: true,
       manualFunctionCalls: false,
-      midSessionChatCtxUpdate: false,
+      midSessionContextUpdate: false,
       midSessionInstructionsUpdate: false,
       midSessionToolsUpdate: false,
       ...capabilitiesOverrides,
@@ -199,7 +195,10 @@ describe('AgentActivity RT session reuse eligibility', () => {
     const oldActivity = createRtActivity(oldAgent, sharedLlm, rtSession);
     const newActivity = createRtActivity(newAgent, sharedLlm);
 
-    const resources = await detachResources(oldActivity, newActivity);
+    const resources = await (AgentActivity.prototype as any)._detachReusableResources.call(
+      oldActivity,
+      newActivity,
+    );
 
     expect(resources.rtSession).toBe(rtSession);
     expect(oldActivity.realtimeSession).toBeUndefined();
@@ -214,7 +213,10 @@ describe('AgentActivity RT session reuse eligibility', () => {
     const oldActivity = createRtActivity(new Agent({ instructions: 'a' }), oldLlm, rtSession);
     const newActivity = createRtActivity(new Agent({ instructions: 'a' }), newLlm);
 
-    const resources = await detachResources(oldActivity, newActivity);
+    const resources = await (AgentActivity.prototype as any)._detachReusableResources.call(
+      oldActivity,
+      newActivity,
+    );
 
     expect(resources.rtSession).toBeUndefined();
   });
@@ -226,7 +228,10 @@ describe('AgentActivity RT session reuse eligibility', () => {
     const oldActivity = createRtActivity(new Agent({ instructions: 'old' }), sharedLlm, rtSession);
     const newActivity = createRtActivity(new Agent({ instructions: 'new' }), sharedLlm);
 
-    const resources = await detachResources(oldActivity, newActivity);
+    const resources = await (AgentActivity.prototype as any)._detachReusableResources.call(
+      oldActivity,
+      newActivity,
+    );
 
     expect(resources.rtSession).toBeUndefined();
   });
@@ -238,19 +243,27 @@ describe('AgentActivity RT session reuse eligibility', () => {
     const oldActivity = createRtActivity(new Agent({ instructions: 'old' }), sharedLlm, rtSession);
     const newActivity = createRtActivity(new Agent({ instructions: 'new' }), sharedLlm);
 
-    const resources = await detachResources(oldActivity, newActivity);
+    const resources = await (AgentActivity.prototype as any)._detachReusableResources.call(
+      oldActivity,
+      newActivity,
+    );
 
     expect(resources.rtSession).toBe(rtSession);
   });
 
-  it('reuses RT session when context differs but midSessionChatCtxUpdate is true', async () => {
-    const sharedLlm = createFakeRealtimeModel({ midSessionChatCtxUpdate: true });
+  it('reuses RT session when context differs but midSessionContextUpdate is true', async () => {
+    const sharedLlm = createFakeRealtimeModel({ midSessionContextUpdate: true });
     const rtSession = createFakeRtSession();
+    // Give the session a non-empty chat context
+    (rtSession as any).chatCtx = ChatContext.empty();
 
     const oldActivity = createRtActivity(new Agent({ instructions: 'same' }), sharedLlm, rtSession);
     const newActivity = createRtActivity(new Agent({ instructions: 'same' }), sharedLlm);
 
-    const resources = await detachResources(oldActivity, newActivity);
+    const resources = await (AgentActivity.prototype as any)._detachReusableResources.call(
+      oldActivity,
+      newActivity,
+    );
 
     expect(resources.rtSession).toBe(rtSession);
   });
@@ -260,7 +273,10 @@ describe('AgentActivity RT session reuse eligibility', () => {
     const oldActivity = createRtActivity(new Agent({ instructions: 'a' }), sharedLlm, undefined);
     const newActivity = createRtActivity(new Agent({ instructions: 'a' }), sharedLlm);
 
-    const resources = await detachResources(oldActivity, newActivity);
+    const resources = await (AgentActivity.prototype as any)._detachReusableResources.call(
+      oldActivity,
+      newActivity,
+    );
 
     expect(resources.rtSession).toBeUndefined();
   });
@@ -276,7 +292,10 @@ describe('AgentActivity RT session reuse eligibility', () => {
     );
     const newActivity = createRtActivity(new Agent({ instructions: 'a' }), nonRealtimeLlm);
 
-    const resources = await detachResources(oldActivity, newActivity);
+    const resources = await (AgentActivity.prototype as any)._detachReusableResources.call(
+      oldActivity,
+      newActivity,
+    );
 
     expect(resources.rtSession).toBeUndefined();
   });
@@ -287,8 +306,8 @@ describe('cleanupReusableResources', () => {
     const sttClose = vi.fn(async () => {});
     const rtClose = vi.fn(async () => {});
     const resources: ReusableResources = {
-      sttPipeline: { close: sttClose } as unknown as ReusableResources['sttPipeline'],
-      rtSession: { close: rtClose } as unknown as ReusableResources['rtSession'],
+      sttPipeline: { close: sttClose } as any,
+      rtSession: { close: rtClose } as any,
     };
 
     await cleanupReusableResources(resources);
@@ -302,7 +321,7 @@ describe('cleanupReusableResources', () => {
   it('handles partial resources (only STT)', async () => {
     const sttClose = vi.fn(async () => {});
     const resources: ReusableResources = {
-      sttPipeline: { close: sttClose } as unknown as ReusableResources['sttPipeline'],
+      sttPipeline: { close: sttClose } as any,
     };
 
     await cleanupReusableResources(resources);

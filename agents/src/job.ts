@@ -10,7 +10,6 @@ import type {
   RtcConfiguration,
 } from '@livekit/rtc-node';
 import { ParticipantKind, RoomEvent, TrackKind } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -23,28 +22,19 @@ import type { AgentSession } from './voice/agent_session.js';
 import { type SessionReport, createSessionReport } from './voice/report.js';
 
 // AsyncLocalStorage for job context, similar to Python's contextvars
-const jobContextStorage = new AsyncLocalStorage<JobContext<unknown>>();
+const jobContextStorage = new AsyncLocalStorage<JobContext>();
 
 /**
  * Returns the current job context.
  *
- * @param required - If true (default), throws when no context is found. If false, returns undefined.
- * @throws {Error} if no job context is found and required is true
+ * @throws {Error} if no job context is found
  */
-export function getJobContext<ProcessUserData = Record<string, unknown>>(
-  required?: true,
-): JobContext<ProcessUserData>;
-export function getJobContext<ProcessUserData = Record<string, unknown>>(
-  required: false,
-): JobContext<ProcessUserData> | undefined;
-export function getJobContext<ProcessUserData = Record<string, unknown>>(
-  required = true,
-): JobContext<ProcessUserData> | undefined {
+export function getJobContext(): JobContext {
   const ctx = jobContextStorage.getStore();
-  if (!ctx && required) {
+  if (!ctx) {
     throw new Error('no job context found, are you running this code inside a job entrypoint?');
   }
-  return ctx as JobContext<ProcessUserData> | undefined;
+  return ctx;
 }
 
 /**
@@ -52,7 +42,7 @@ export function getJobContext<ProcessUserData = Record<string, unknown>>(
  * @internal
  */
 export function runWithJobContext<T>(context: JobContext, fn: () => T): T {
-  return jobContextStorage.run(context as JobContext<unknown>, fn);
+  return jobContextStorage.run(context, fn);
 }
 
 /**
@@ -60,7 +50,7 @@ export function runWithJobContext<T>(context: JobContext, fn: () => T): T {
  * @internal
  */
 export function runWithJobContextAsync<T>(context: JobContext, fn: () => Promise<T>): Promise<T> {
-  return jobContextStorage.run(context as JobContext<unknown>, fn);
+  return jobContextStorage.run(context, fn);
 }
 
 /** Which tracks, if any, should the agent automatically subscribe to? */
@@ -95,21 +85,18 @@ export class FunctionExistsError extends Error {
 }
 
 /** The job and environment context as seen by the agent, accessible by the entrypoint function. */
-export class JobContext<ProcessUserData = Record<string, unknown>> {
-  #proc: JobProcess<ProcessUserData>;
+export class JobContext {
+  #proc: JobProcess;
   #info: RunningJobInfo;
   #room: Room;
   #onConnect: () => void;
   #onShutdown: (s: string) => void;
   /** @internal */
   shutdownCallbacks: (() => Promise<void>)[] = [];
-  #participantEntrypoints: ((
-    job: JobContext<ProcessUserData>,
-    p: RemoteParticipant,
-  ) => Promise<void>)[] = [];
+  #participantEntrypoints: ((job: JobContext, p: RemoteParticipant) => Promise<void>)[] = [];
   #participantTasks: {
     [id: string]: {
-      callback: (job: JobContext<ProcessUserData>, p: RemoteParticipant) => Promise<void>;
+      callback: (job: JobContext, p: RemoteParticipant) => Promise<void>;
       result: Promise<void>;
     };
   } = {};
@@ -125,7 +112,7 @@ export class JobContext<ProcessUserData = Record<string, unknown>> {
   private connected: boolean = false;
 
   constructor(
-    proc: JobProcess<ProcessUserData>,
+    proc: JobProcess,
     info: RunningJobInfo,
     room: Room,
     onConnect: () => void,
@@ -147,7 +134,7 @@ export class JobContext<ProcessUserData = Record<string, unknown>> {
     this._sessionDirectory = path.join(os.tmpdir(), 'livekit-agents', `job-${this.#info.job.id}`);
   }
 
-  get proc(): JobProcess<ProcessUserData> {
+  get proc(): JobProcess {
     return this.#proc;
   }
 
@@ -201,7 +188,7 @@ export class JobContext<ProcessUserData = Record<string, unknown>> {
       }
     }
 
-    return new ThrowsPromise<RemoteParticipant, Error>((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const onParticipantConnected = (participant: RemoteParticipant) => {
         if (
           (!identity || participant.identity === identity) &&
@@ -380,9 +367,7 @@ export class JobContext<ProcessUserData = Record<string, unknown>> {
    *
    * @throws {@link FunctionExistsError} if an entrypoint already exists
    */
-  addParticipantEntrypoint(
-    callback: (job: JobContext<ProcessUserData>, p: RemoteParticipant) => Promise<void>,
-  ) {
+  addParticipantEntrypoint(callback: (job: JobContext, p: RemoteParticipant) => Promise<void>) {
     if (this.#participantEntrypoints.includes(callback)) {
       throw new FunctionExistsError('entrypoints cannot be added more than once');
     }
@@ -405,9 +390,9 @@ export class JobContext<ProcessUserData = Record<string, unknown>> {
   }
 }
 
-export class JobProcess<UserData = Record<string, unknown>> {
+export class JobProcess {
   #pid = process.pid;
-  userData = {} as UserData;
+  userData: { [id: string]: unknown } = {};
 
   get pid(): number {
     return this.#pid;

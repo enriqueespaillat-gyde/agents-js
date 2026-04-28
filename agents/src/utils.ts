@@ -9,7 +9,7 @@ import type {
   TrackKind,
 } from '@livekit/rtc-node';
 import { AudioFrame, AudioResampler, RoomEvent } from '@livekit/rtc-node';
-import { type Throws, ThrowsPromise } from '@livekit/throws-transformer/throws';
+import type { Throws } from '@livekit/throws-transformer/throws';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { EventEmitter, once } from 'node:events';
 import type { ReadableStream } from 'node:stream/web';
@@ -39,12 +39,9 @@ export type AudioBuffer = AudioFrame[] | AudioFrame;
 
 export const noop = () => {};
 
-export const isPending = async (promise: Promise<unknown>): Promise<Throws<boolean, Error>> => {
+export const isPending = async (promise: Promise<unknown>): Promise<boolean> => {
   const sentinel = Symbol('sentinel');
-  const result = await Promise.race([
-    ThrowsPromise.fromPromise<unknown, Error>(promise),
-    ThrowsPromise.resolve(sentinel),
-  ]);
+  const result = await Promise.race([promise, Promise.resolve(sentinel)]);
   return result === sentinel;
 };
 
@@ -104,7 +101,7 @@ export class Queue<T> {
         await once(this.#events, 'put');
       }
       let item = this.items.shift();
-      if (typeof item === 'undefined') {
+      if (!item) {
         item = await _get();
       }
       return item;
@@ -125,17 +122,17 @@ export class Queue<T> {
 }
 
 /** @internal */
-export class Future<T = void, E extends Error = Error> {
-  #await: ThrowsPromise<T, E>;
+export class Future<T = void> {
+  #await: Promise<T>;
   #resolvePromise!: (value: T) => void;
-  #rejectPromise!: (error: E) => void;
+  #rejectPromise!: (error: Error) => void;
   #done: boolean = false;
   #rejected: boolean = false;
   #result: T | undefined = undefined;
   #error: Error | undefined = undefined;
 
   constructor() {
-    this.#await = new ThrowsPromise<T, E>((resolve, reject) => {
+    this.#await = new Promise<T>((resolve, reject) => {
       this.#resolvePromise = resolve;
       this.#rejectPromise = reject;
     });
@@ -172,7 +169,7 @@ export class Future<T = void, E extends Error = Error> {
     this.#resolvePromise(value);
   }
 
-  reject(error: E) {
+  reject(error: Error) {
     this.#done = true;
     this.#rejected = true;
     this.#error = error;
@@ -194,7 +191,7 @@ export class Event {
     if (this.#isSet) return true;
 
     let resolve: () => void = noop;
-    const waiter = new ThrowsPromise<void, never>((r) => {
+    const waiter = new Promise<void>((r) => {
       resolve = r;
       this.#waiters.push(resolve);
     });
@@ -228,26 +225,26 @@ export class Event {
 }
 
 /** @internal */
-export class CancellablePromise<T, E extends Error = Error> {
-  #promise: ThrowsPromise<T, E>;
+export class CancellablePromise<T> {
+  #promise: Promise<T>;
   #cancelFn: () => void;
   #isCancelled: boolean = false;
-  #error: E | null = null;
+  #error: Error | null = null;
 
   constructor(
     executor: (
       resolve: (value: T | PromiseLike<T>) => void,
-      reject: (reason: E) => void,
+      reject: (reason?: unknown) => void,
       onCancel: (cancelFn: () => void) => void,
     ) => void,
   ) {
     let cancel: () => void;
 
-    this.#promise = new ThrowsPromise<T, E>((resolve, reject) => {
+    this.#promise = new Promise<T>((resolve, reject) => {
       executor(
         resolve,
         (reason) => {
-          this.#error = reason;
+          this.#error = reason instanceof Error ? reason : new Error(String(reason));
           reject(reason);
         },
         (cancelFn) => {
@@ -272,18 +269,18 @@ export class CancellablePromise<T, E extends Error = Error> {
 
   then<TResult1 = T, TResult2 = never>(
     onfulfilled?: ((value: T) => TResult1 | Promise<TResult1>) | null,
-    onrejected?: ((reason: E) => TResult2 | Promise<TResult2>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | Promise<TResult2>) | null,
   ): Promise<TResult1 | TResult2> {
     return this.#promise.then(onfulfilled, onrejected);
   }
 
   catch<TResult = never>(
-    onrejected?: ((reason: E) => TResult | Promise<TResult>) | null,
-  ): Promise<Throws<T | TResult | undefined, E>> {
+    onrejected?: ((reason: unknown) => TResult | Promise<TResult>) | null,
+  ): Promise<T | TResult> {
     return this.#promise.catch(onrejected);
   }
 
-  finally(onfinally?: (() => void) | null): Promise<Throws<T, E>> {
+  finally(onfinally?: (() => void) | null): Promise<T> {
     return this.#promise.finally(onfinally);
   }
 
@@ -291,8 +288,6 @@ export class CancellablePromise<T, E extends Error = Error> {
     this.#cancelFn();
   }
 
-  static from<T, E extends Error = Error>(promise: Promise<Throws<T, E>>): CancellablePromise<T, E>;
-  static from<T>(promise: Promise<T>): CancellablePromise<T>;
   static from<T>(promise: Promise<T>): CancellablePromise<T> {
     return new CancellablePromise<T>((resolve, reject) => {
       promise.then(resolve).catch(reject);
@@ -555,7 +550,7 @@ export class Task<T> {
       promises.push(delay(timeout).then(() => TaskResult.Timeout));
     }
 
-    const result = await ThrowsPromise.race(promises);
+    const result = await Promise.race(promises);
 
     // Check what happened
     if (result === TaskResult.Timeout) {
@@ -593,19 +588,19 @@ export class Task<T> {
 }
 
 export async function waitFor(tasks: Task<void>[]): Promise<void> {
-  await ThrowsPromise.allSettled(tasks.map((task) => task.result));
+  await Promise.allSettled(tasks.map((task) => task.result));
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function cancelAndWait(tasks: Task<any>[], timeout?: number): Promise<void> {
-  await ThrowsPromise.allSettled(tasks.map((task) => task.cancelAndWait(timeout)));
+  await Promise.allSettled(tasks.map((task) => task.cancelAndWait(timeout)));
 }
 
 export function withResolvers<T = unknown>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason: Error) => void;
+  let reject!: (reason?: unknown) => void;
 
-  const promise = new ThrowsPromise<T, Error>((res, rej) => {
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
     reject = rej;
   });
@@ -728,7 +723,6 @@ export function resampleStream({
         for (const frame of resampler.flush()) {
           controller.enqueue(frame);
         }
-        resampler.close();
       }
     },
   });
@@ -811,8 +805,8 @@ export type DelayOptions = {
  */
 export function delay(ms: number, options: DelayOptions = {}): Promise<void> {
   const { signal } = options;
-  if (signal?.aborted) return ThrowsPromise.reject(signal.reason ?? new Error('delay aborted'));
-  return new ThrowsPromise<void, Error>((resolve, reject) => {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error('delay aborted'));
+  return new Promise((resolve, reject) => {
     const abort = () => {
       clearTimeout(i);
       reject(signal?.reason ?? new Error('delay aborted'));
@@ -845,9 +839,9 @@ export function waitUntilTimeout<T, E extends Error = IdleTimeoutError>(
   throwError?: () => E,
 ): Promise<Throws<T, E | IdleTimeoutError>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  return ThrowsPromise.race([
+  return Promise.race([
     promise,
-    new ThrowsPromise<never, E | IdleTimeoutError>((_, reject) => {
+    new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(throwError?.() ?? new IdleTimeoutError()), timeoutMs);
     }),
   ]).finally(() => clearTimeout(timer)) as Promise<Throws<T, E>>;
@@ -976,13 +970,12 @@ export async function* readStream<T>(
   stream: ReadableStream<T>,
   signal?: AbortSignal,
 ): AsyncGenerator<T> {
-  if (signal?.aborted) return;
   const reader = stream.getReader();
   try {
     if (signal) {
       const abortPromise = waitForAbort(signal);
       while (true) {
-        const result = await ThrowsPromise.race([reader.read(), abortPromise]);
+        const result = await Promise.race([reader.read(), abortPromise]);
         if (!result) break;
         const { done, value } = result;
         if (done) break;
@@ -1071,69 +1064,3 @@ export const isDevMode = (): boolean => {
 export const isHosted = (): boolean => {
   return process.env.LIVEKIT_REMOTE_EOT_URL !== undefined;
 };
-
-export function asError(maybeError: unknown): Error {
-  if (maybeError instanceof Error) {
-    return maybeError;
-  }
-  return new Error(String(maybeError));
-}
-
-/**
- * Tagged template literal that strips common leading indentation from every line,
- * trims the first empty line and any trailing whitespace.
- *
- * Useful for writing multi-line strings inside indented code without the indentation
- * leaking into the runtime value.
- *
- * @example
- * ```ts
- * const msg = dedent`
- *   Hello,
- *     world!
- * `;
- * // "Hello,\n  world!"
- * ```
- */
-export function dedent(strings: TemplateStringsArray, ...values: unknown[]): string {
-  // Build the raw string with interpolations
-  let result = '';
-  for (let i = 0; i < strings.length; i++) {
-    result += strings[i];
-    if (i < values.length) {
-      result += String(values[i]);
-    }
-  }
-
-  // Strip the leading newline (first line is usually empty after the backtick)
-  if (result.startsWith('\n')) {
-    result = result.slice(1);
-  }
-
-  const lines = result.split('\n');
-
-  // Find the minimum indentation across non-empty lines
-  let minIndent = Infinity;
-  for (const line of lines) {
-    if (line.trim().length === 0) continue;
-    let spaces = 0;
-    for (const ch of line) {
-      if (ch === ' ' || ch === '\t') {
-        spaces++;
-      } else {
-        break;
-      }
-    }
-    minIndent = Math.min(minIndent, spaces);
-  }
-
-  if (minIndent === Infinity) {
-    minIndent = 0;
-  }
-
-  // Remove common indentation and join
-  return lines
-    .map((line) => line.slice(minIndent))
-    .join('\n')
-    .trimEnd();
-}

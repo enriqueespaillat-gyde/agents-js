@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Mutex } from '@livekit/mutex';
 import type { AudioFrame } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import type { Span } from '@opentelemetry/api';
 import { ROOT_CONTEXT, context as otelContext, trace } from '@opentelemetry/api';
 import { Heap } from 'heap-js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ReadableStream, TransformStream } from 'node:stream/web';
-import type { Logger } from 'pino';
 import type { InterruptionDetectionError } from '../inference/interruption/errors.js';
 import { AdaptiveInterruptionDetector } from '../inference/interruption/interruption_detector.js';
 import type { OverlappingSpeechEvent } from '../inference/interruption/types.js';
@@ -103,42 +101,14 @@ export interface ReusableResources {
   rtSession?: RealtimeSession;
 }
 
-export class SchedulingPausedError extends Error {
-  constructor() {
-    super('cannot schedule new speech, the speech scheduling is draining/pausing');
-    this.name = 'SchedulingPausedError';
-  }
-}
-
-export function isSchedulingPausedError(error: unknown): error is SchedulingPausedError {
-  return error instanceof SchedulingPausedError;
-}
-
-export async function cleanupReusableResources(
-  resources: ReusableResources,
-  logger: Logger,
-): Promise<void> {
-  const tasks: Promise<void>[] = [];
+export async function cleanupReusableResources(resources: ReusableResources): Promise<void> {
   if (resources.sttPipeline) {
-    tasks.push(resources.sttPipeline.close());
+    await resources.sttPipeline.close();
     resources.sttPipeline = undefined;
   }
   if (resources.rtSession) {
-    tasks.push(resources.rtSession.close());
+    await resources.rtSession.close();
     resources.rtSession = undefined;
-  }
-
-  if (tasks.length > 0) {
-    const outputs = await ThrowsPromise.allSettled(tasks);
-    for (const output of outputs) {
-      if (output.status === 'rejected') {
-        if (logger) {
-          logger.error({ error: output.reason }, 'error cleaning up reusable resources');
-        } else {
-          console.error('error cleaning up reusable resources', output.reason);
-        }
-      }
-    }
   }
 }
 
@@ -166,16 +136,11 @@ export class AgentActivity implements RecognitionHooks {
   private turnDetectionMode?: TurnDetectionMode;
   private logger = log();
   private _schedulingPaused = true;
-  private _authorizationPaused = false;
   private _drainBlockedTasks: Task<any>[] = [];
   private _currentSpeech?: SpeechHandle;
   private speechQueue: Heap<[number, number, SpeechHandle]>; // [priority, timestamp, speechHandle]
-  private q_updated: Future<void, never>;
+  private q_updated: Future;
   private speechTasks: Set<Task<void>> = new Set();
-  // Handles whose TTS playout has finished but whose tool execution is still running.
-  // Tracking them lets interrupt() reach handles that are no longer _currentSpeech but
-  // still own an in-flight tool call (which may have scheduled further speech handles).
-  private _backgroundSpeeches: Set<SpeechHandle> = new Set();
   private lock = new Mutex();
   private audioStream = new MultiInputStream<AudioFrame>();
   private audioStreamId?: string;
@@ -183,7 +148,6 @@ export class AgentActivity implements RecognitionHooks {
   // default to null as None, which maps to the default provider tool choice value
   private toolChoice: ToolChoice | null = null;
   private _preemptiveGeneration?: PreemptiveGeneration;
-  private _preemptiveGenerationCount = 0;
   private interruptionDetector?: AdaptiveInterruptionDetector;
   private isInterruptionDetectionEnabled: boolean;
   private isInterruptionByAudioActivityEnabled: boolean;
@@ -387,7 +351,6 @@ export class AgentActivity implements RecognitionHooks {
 
     if (this.llm instanceof RealtimeModel) {
       const rtReused = reuseResources?.rtSession !== undefined;
-
       if (rtReused) {
         this.logger.debug('reusing realtime session from previous activity');
         this.realtimeSession = reuseResources!.rtSession;
@@ -416,16 +379,28 @@ export class AgentActivity implements RecognitionHooks {
       // skip the update if the session is reused and no mid-session update is supported
       // this means the content is the same as the previous session
       const capabilities = this.llm.capabilities;
-      try {
-        await this.realtimeSession!._updateSession(
-          !rtReused || capabilities.midSessionInstructionsUpdate
-            ? this.agent.instructions
-            : undefined,
-          !rtReused || capabilities.midSessionChatCtxUpdate ? this.agent.chatCtx : undefined,
-          !rtReused || capabilities.midSessionToolsUpdate ? this.tools : undefined,
-        );
-      } catch (error) {
-        this.logger.error(error, 'failed to update realtime session');
+      if (!rtReused || capabilities.midSessionInstructionsUpdate) {
+        try {
+          await this.realtimeSession!.updateInstructions(this.agent.instructions);
+        } catch (error) {
+          this.logger.error(error, 'failed to update the instructions');
+        }
+      }
+
+      if (!rtReused || capabilities.midSessionContextUpdate) {
+        try {
+          await this.realtimeSession!.updateChatCtx(this.agent.chatCtx);
+        } catch (error) {
+          this.logger.error(error, 'failed to update the chat context');
+        }
+      }
+
+      if (!rtReused || capabilities.midSessionToolsUpdate) {
+        try {
+          await this.realtimeSession!.updateTools(this.tools);
+        } catch (error) {
+          this.logger.error(error, 'failed to update the tools');
+        }
       }
 
       if (!capabilities.audioOutput && !this.tts && this.agentSession.output.audio) {
@@ -513,6 +488,7 @@ export class AgentActivity implements RecognitionHooks {
         inlineTask: true,
         name: 'AgentActivity_onEnter',
       });
+      this.agentSession._trackRunHandle(this._onEnterTask);
     }
 
     startSpan.end();
@@ -520,65 +496,56 @@ export class AgentActivity implements RecognitionHooks {
 
   async _detachReusableResources(newActivity: AgentActivity): Promise<ReusableResources> {
     const resources: ReusableResources = {};
-    try {
-      // stt pipeline
-      if (
-        this.audioRecognition &&
-        this.stt &&
-        newActivity.stt &&
-        this.stt === newActivity.stt &&
-        Object.getPrototypeOf(this.agent).sttNode ===
-          Object.getPrototypeOf(newActivity.agent).sttNode
-      ) {
-        resources.sttPipeline = await this.audioRecognition.detachSttPipeline();
-      }
 
-      // rt session
-      if (
-        this.realtimeSession &&
-        this.llm instanceof RealtimeModel &&
-        this.llm === newActivity.llm
-      ) {
-        const capabilities = this.llm.capabilities;
+    // stt pipeline
+    if (
+      this.audioRecognition &&
+      this.stt &&
+      newActivity.stt &&
+      this.stt === newActivity.stt &&
+      Object.getPrototypeOf(this.agent).sttNode === Object.getPrototypeOf(newActivity.agent).sttNode
+    ) {
+      resources.sttPipeline = await this.audioRecognition.detachSttPipeline();
+    }
 
-        // context update is supported or chat context is equivalent
-        let reusable =
-          capabilities.midSessionChatCtxUpdate ||
-          this.realtimeSession.chatCtx
-            .copy({ excludeInstructions: true, excludeHandoff: true })
-            .isEquivalent(
-              newActivity.agent.chatCtx.copy({ excludeInstructions: true, excludeHandoff: true }),
-            );
+    // rt session
+    if (this.realtimeSession && this.llm instanceof RealtimeModel && this.llm === newActivity.llm) {
+      const capabilities = this.llm.capabilities;
 
-        // instructions update is supported or instructions are the same
-        reusable =
-          reusable &&
-          (capabilities.midSessionInstructionsUpdate ||
-            this.agent.instructions === newActivity.agent.instructions);
-
-        // tools update is supported or tools are the same
-        reusable =
-          reusable &&
-          (capabilities.midSessionToolsUpdate || isSameToolContext(this.tools, newActivity.tools));
-
-        if (reusable) {
-          // detach: remove event listeners but don't close the session
-          this.realtimeSession.off('generation_created', this.onRealtimeGenerationCreated);
-          this.realtimeSession.off('input_speech_started', this.onRealtimeInputSpeechStarted);
-          this.realtimeSession.off('input_speech_stopped', this.onRealtimeInputSpeechStopped);
-          this.realtimeSession.off(
-            'input_audio_transcription_completed',
-            this.onRealtimeInputAudioTranscriptionCompleted,
+      // context update is supported or chat context is equivalent
+      let reusable =
+        capabilities.midSessionContextUpdate ||
+        this.realtimeSession.chatCtx
+          .copy({ excludeInstructions: true, excludeHandoff: true })
+          .isEquivalent(
+            newActivity.agent.chatCtx.copy({ excludeInstructions: true, excludeHandoff: true }),
           );
-          this.realtimeSession.off('metrics_collected', this.onMetricsCollected);
-          this.realtimeSession.off('error', this.onModelError);
-          resources.rtSession = this.realtimeSession;
-          this.realtimeSession = undefined; // prevent _closeSessionResources from closing it
-        }
+
+      // instructions update is supported or instructions are the same
+      reusable =
+        reusable &&
+        (capabilities.midSessionInstructionsUpdate ||
+          this.agent.instructions === newActivity.agent.instructions);
+
+      // tools update is supported or tools are the same
+      reusable =
+        reusable &&
+        (capabilities.midSessionToolsUpdate || isSameToolContext(this.tools, newActivity.tools));
+
+      if (reusable) {
+        // detach: remove event listeners but don't close the session
+        this.realtimeSession.off('generation_created', this.onRealtimeGenerationCreated);
+        this.realtimeSession.off('input_speech_started', this.onRealtimeInputSpeechStarted);
+        this.realtimeSession.off('input_speech_stopped', this.onRealtimeInputSpeechStopped);
+        this.realtimeSession.off(
+          'input_audio_transcription_completed',
+          this.onRealtimeInputAudioTranscriptionCompleted,
+        );
+        this.realtimeSession.off('metrics_collected', this.onMetricsCollected);
+        this.realtimeSession.off('error', this.onModelError);
+        resources.rtSession = this.realtimeSession;
+        this.realtimeSession = undefined; // prevent _closeSessionResources from closing it
       }
-    } catch (error) {
-      await cleanupReusableResources(resources, this.logger);
-      throw error;
     }
 
     return resources;
@@ -621,20 +588,6 @@ export class AgentActivity implements RecognitionHooks {
 
   get schedulingPaused(): boolean {
     return this._schedulingPaused;
-  }
-
-  pauseReplyAuthorization(): void {
-    this._authorizationPaused = true;
-    this.wakeupMainTask();
-  }
-
-  resumeReplyAuthorization(): void {
-    if (!this._authorizationPaused) {
-      return;
-    }
-
-    this._authorizationPaused = false;
-    this.wakeupMainTask();
   }
 
   get realtimeLLMSession(): RealtimeSession | undefined {
@@ -829,15 +782,33 @@ export class AgentActivity implements RecognitionHooks {
       allowInterruptions: defaultAllowInterruptions,
       addToChatCtx = true,
     } = options ?? {};
-    const allowInterruptions = defaultAllowInterruptions;
+    let allowInterruptions = defaultAllowInterruptions;
+
+    if (
+      this.llm instanceof RealtimeModel &&
+      this.llm.capabilities.turnDetection &&
+      this.tts &&
+      allowInterruptions === false
+    ) {
+      this.logger.warn(
+        'the RealtimeModel uses a server-side turn detection, allowInterruptions cannot be false when using VoiceAgent.say(), ' +
+          'disable turnDetection in the RealtimeModel and use VAD on the AgentTask/VoiceAgent instead',
+      );
+      allowInterruptions = true;
+    }
 
     if (
       !audio &&
       !this.tts &&
+      this.realtimeSession === undefined &&
       this.agentSession.output.audio &&
       this.agentSession.output.audioEnabled
     ) {
-      throw new Error('trying to generate speech from text without a TTS model');
+      const modelInfo =
+        this.llm instanceof RealtimeModel
+          ? 'a RealtimeSession that implements say()'
+          : 'a TTS model';
+      throw new Error(`trying to generate speech from text without ${modelInfo}`);
     }
 
     const handle = SpeechHandle.create({
@@ -853,14 +824,28 @@ export class AgentActivity implements RecognitionHooks {
       }),
     );
 
-    const task = this.createSpeechTask({
-      taskFn: (abortController: AbortController) =>
-        this.ttsTask(handle, text, addToChatCtx, {}, abortController, audio),
-      ownedSpeechHandle: handle,
-      name: 'AgentActivity.tts_say',
-    });
+    let task: Task<void>;
+    if (this.realtimeSession !== undefined && !audio && !this.tts) {
+      task = this.createSpeechTask({
+        taskFn: (abortController: AbortController) =>
+          this.realtimeSayTask(handle, text, addToChatCtx, {}, abortController),
+        ownedSpeechHandle: handle,
+        name: 'AgentActivity.realtime_say',
+      });
+    } else {
+      task = this.createSpeechTask({
+        taskFn: (abortController: AbortController) =>
+          this.ttsTask(handle, text, addToChatCtx, {}, abortController, audio),
+        ownedSpeechHandle: handle,
+        name: 'AgentActivity.tts_say',
+      });
+    }
 
-    task.result.finally(() => this.onPipelineReplyDone());
+    // Avoid duplicate state transitions for realtime say path: realtimeGenerationTask already
+    // performs end-of-speech transitions internally.
+    if (this.realtimeSession === undefined || audio !== undefined || this.tts) {
+      task.result.finally(() => this.onPipelineReplyDone());
+    }
     this.scheduleSpeech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL);
     return handle;
   }
@@ -1146,7 +1131,7 @@ export class AgentActivity implements RecognitionHooks {
         transcript: ev.alternatives![0].text,
         isFinal: false,
         language: ev.alternatives![0].language,
-        speakerId: ev.alternatives![0].speakerId ?? null,
+        // TODO(AJS-106): add multi participant support
       }),
     );
 
@@ -1167,7 +1152,7 @@ export class AgentActivity implements RecognitionHooks {
         transcript: ev.alternatives![0].text,
         isFinal: true,
         language: ev.alternatives![0].language,
-        speakerId: ev.alternatives![0].speakerId ?? null,
+        // TODO(AJS-106): add multi participant support
       }),
     );
 
@@ -1187,9 +1172,8 @@ export class AgentActivity implements RecognitionHooks {
   }
 
   onPreemptiveGeneration(info: PreemptiveGenerationInfo): void {
-    const preemptiveOpts = this.agentSession.sessionOptions.turnHandling.preemptiveGeneration;
     if (
-      !preemptiveOpts.enabled ||
+      !this.agentSession.sessionOptions.preemptiveGeneration ||
       this.schedulingPaused ||
       (this._currentSpeech !== undefined && !this._currentSpeech.interrupted) ||
       !(this.llm instanceof LLM)
@@ -1198,19 +1182,6 @@ export class AgentActivity implements RecognitionHooks {
     }
 
     this.cancelPreemptiveGeneration();
-
-    if (
-      info.startedSpeakingAt !== undefined &&
-      Date.now() - info.startedSpeakingAt > preemptiveOpts.maxSpeechDuration
-    ) {
-      return;
-    }
-
-    if (this._preemptiveGenerationCount >= preemptiveOpts.maxRetries) {
-      return;
-    }
-
-    this._preemptiveGenerationCount++;
 
     this.logger.info(
       {
@@ -1248,16 +1219,6 @@ export class AgentActivity implements RecognitionHooks {
       this._preemptiveGeneration.speechHandle._cancel();
       this._preemptiveGeneration = undefined;
     }
-  }
-
-  private _interruptBackgroundSpeeches(force: boolean): SpeechHandle[] {
-    const interrupted: SpeechHandle[] = [];
-    for (const speech of this._backgroundSpeeches) {
-      if (force || speech.allowInterruptions) {
-        interrupted.push(speech.interrupt(force));
-      }
-    }
-    return interrupted;
   }
 
   private createSpeechTask(options: {
@@ -1360,7 +1321,7 @@ export class AgentActivity implements RecognitionHooks {
   }
 
   private async mainTask(signal: AbortSignal): Promise<void> {
-    const abortFuture = new Future<void, never>();
+    const abortFuture = new Future();
     const abortHandler = () => {
       abortFuture.resolve();
       signal.removeEventListener('abort', abortHandler);
@@ -1368,7 +1329,7 @@ export class AgentActivity implements RecognitionHooks {
     signal.addEventListener('abort', abortHandler);
 
     while (true) {
-      await ThrowsPromise.race([this.q_updated.await, abortFuture.await]);
+      await Promise.race([this.q_updated.await, abortFuture.await]);
       if (signal.aborted) break;
 
       while (this.speechQueue.size() > 0) {
@@ -1377,10 +1338,6 @@ export class AgentActivity implements RecognitionHooks {
         const heapItem = this.speechQueue.pop();
         if (!heapItem) {
           throw new Error('Speech queue is empty');
-        }
-        if (this._authorizationPaused) {
-          this.speechQueue.push(heapItem);
-          break;
         }
         const speechHandle = heapItem[2];
 
@@ -1579,7 +1536,7 @@ export class AgentActivity implements RecognitionHooks {
     const future = new Future<void>();
     const currentSpeech = this._currentSpeech;
 
-    this._interruptBackgroundSpeeches(force);
+    //TODO(AJS-273): add interrupt for background speeches
 
     currentSpeech?.interrupt(force);
 
@@ -1632,8 +1589,6 @@ export class AgentActivity implements RecognitionHooks {
       // is detected. So the previous execution should complete quickly.
       await oldTask.result;
     }
-
-    this._preemptiveGenerationCount = 0;
 
     // When the audio recognition detects the end of a user turn:
     //  - check if realtime model server-side turn detection is enabled
@@ -2014,37 +1969,22 @@ export class AgentActivity implements RecognitionHooks {
     let ttsGenData: _TTSGenerationData | null = null;
     let llmOutput: ReadableStream<string>;
 
-    // Helper to start TTS inference, used both for preemptive and deferred TTS start.
-    // We always tee the LLM output stream upfront when audio is needed, so the ttsTextInput
-    // is available regardless of when TTS actually starts.
-    let ttsTextInput: ReadableStream<string> | null = null;
-
     if (audioOutput) {
-      // Always tee the stream when audio output is needed
-      const [_ttsTextInput, textOutput] = llmGenData.textStream.tee();
-      ttsTextInput = _ttsTextInput;
+      // Only tee the stream when we need TTS
+      const [ttsTextInput, textOutput] = llmGenData.textStream.tee();
       llmOutput = textOutput;
-    } else {
-      // No TTS needed, use the stream directly
-      llmOutput = llmGenData.textStream;
-    }
-
-    const startTtsInference = (): [Task<void>, _TTSGenerationData] => {
-      return performTTSInference(
+      [ttsTask, ttsGenData] = performTTSInference(
         (...args) => this.agent.ttsNode(...args),
-        ttsTextInput!,
+        ttsTextInput,
         modelSettings,
         replyAbortController,
         this.tts?.model,
         this.tts?.provider,
       );
-    };
-
-    // Start preemptive TTS inference if enabled
-    const preemptiveOpts = this.agentSession.sessionOptions.turnHandling.preemptiveGeneration;
-    if (audioOutput && preemptiveOpts.enabled && preemptiveOpts.preemptiveTts) {
-      [ttsTask, ttsGenData] = startTtsInference();
       tasks.push(ttsTask);
+    } else {
+      // No TTS needed, use the stream directly
+      llmOutput = llmGenData.textStream;
     }
 
     await speechHandle.waitIfNotInterrupted([speechHandle._waitForScheduled()]);
@@ -2063,12 +2003,6 @@ export class AgentActivity implements RecognitionHooks {
       return;
     }
 
-    // Start TTS inference if not already started and audio output is enabled
-    if (audioOutput && ttsTask === null) {
-      [ttsTask, ttsGenData] = startTtsInference();
-      tasks.push(ttsTask);
-    }
-
     this.agentSession._updateAgentState('thinking');
 
     await speechHandle.waitIfNotInterrupted([speechHandle._waitForAuthorization()]);
@@ -2082,11 +2016,11 @@ export class AgentActivity implements RecognitionHooks {
     // Check if we should use TTS aligned transcripts
     if (this.useTtsAlignedTranscript && this.tts?.capabilities.alignedTranscript && ttsGenData) {
       // Race timedTextsFut with ttsTask to avoid hanging if TTS fails before resolving the future
-      const timedTextsStream = await ThrowsPromise.race([
+      const timedTextsStream = await Promise.race([
         ttsGenData.timedTextsFut.await,
         ttsTask?.result.catch(() =>
           this.logger.warn('TTS task failed before resolving timedTextsFut'),
-        ) ?? ThrowsPromise.resolve(),
+        ) ?? Promise.resolve(),
       ]);
       if (timedTextsStream) {
         this.logger.debug('Using TTS aligned transcripts for transcription node input');
@@ -2241,8 +2175,6 @@ export class AgentActivity implements RecognitionHooks {
           );
           if (playbackEv.synchronizedTranscript) {
             forwardedText = playbackEv.synchronizedTranscript;
-          } else {
-            forwardedText = '';
           }
         } else {
           forwardedText = '';
@@ -2258,9 +2190,6 @@ export class AgentActivity implements RecognitionHooks {
           interrupted: true,
           createdAt: replyStartedAt,
           metrics: assistantMetrics,
-          ...(Object.keys(llmGenData.generatedExtra).length > 0
-            ? { extra: llmGenData.generatedExtra }
-            : {}),
         });
         chatCtx.insert(message);
         this.agent._chatCtx.insert(message);
@@ -2295,9 +2224,6 @@ export class AgentActivity implements RecognitionHooks {
         createdAt: replyStartedAt,
         content: textOut.text,
         metrics: assistantMetrics,
-        ...(Object.keys(llmGenData.generatedExtra).length > 0
-          ? { extra: llmGenData.generatedExtra }
-          : {}),
       });
       chatCtx.insert(message);
       this.agent._chatCtx.insert(message);
@@ -2324,12 +2250,7 @@ export class AgentActivity implements RecognitionHooks {
 
     // mark the playout done before waiting for the tool execution
     speechHandle._markGenerationDone();
-    this._backgroundSpeeches.add(speechHandle);
-    try {
-      await executeToolsTask.result;
-    } finally {
-      this._backgroundSpeeches.delete(speechHandle);
-    }
+    await executeToolsTask.result;
 
     if (toolOutput.output.length === 0) return;
 
@@ -2733,8 +2654,6 @@ export class AgentActivity implements RecognitionHooks {
             );
             if (playbackEv.synchronizedTranscript) {
               forwardedText = playbackEv.synchronizedTranscript;
-            } else {
-              forwardedText = '';
             }
           } else {
             forwardedText = '';
@@ -2794,12 +2713,7 @@ export class AgentActivity implements RecognitionHooks {
     speechHandle._markGenerationDone();
     // TODO(brian): close tees
 
-    this._backgroundSpeeches.add(speechHandle);
-    try {
-      await executeToolsTask.result;
-    } finally {
-      this._backgroundSpeeches.delete(speechHandle);
-    }
+    await executeToolsTask.result;
 
     if (toolOutput.output.length > 0) {
       this.agentSession._updateAgentState('thinking');
@@ -2847,7 +2761,7 @@ export class AgentActivity implements RecognitionHooks {
           await this.currentSpeech.waitForPlayout();
         } else {
           // Don't block the event loop
-          await new ThrowsPromise<void, never>((resolve) => setImmediate(resolve));
+          await new Promise((resolve) => setImmediate(resolve));
         }
       }
       const chatCtx = this.realtimeSession.chatCtx.copy();
@@ -2950,6 +2864,45 @@ export class AgentActivity implements RecognitionHooks {
     };
   }
 
+  private async realtimeSayTask(
+    speechHandle: SpeechHandle,
+    text: string | ReadableStream<string>,
+    addToChatCtx: boolean,
+    modelSettings: ModelSettings,
+    replyAbortController: AbortController,
+  ): Promise<void> {
+    speechHandleStorage.enterWith(speechHandle);
+
+    if (!this.realtimeSession) {
+      throw new Error('realtimeSession is not available');
+    }
+
+    await speechHandle.waitIfNotInterrupted([speechHandle._waitForAuthorization()]);
+
+    if (speechHandle.interrupted) {
+      return;
+    }
+
+    let generationEv: GenerationCreatedEvent;
+    try {
+      generationEv = await this.realtimeSession.say(text, {
+        allowInterruptions: speechHandle.allowInterruptions,
+      });
+    } catch (e) {
+      this.logger.error('failed to say text: %s', String(e));
+      this.agentSession._updateAgentState('listening');
+      return;
+    }
+
+    await this.realtimeGenerationTask(
+      speechHandle,
+      generationEv,
+      modelSettings,
+      replyAbortController,
+      addToChatCtx,
+    );
+  }
+
   private async realtimeReplyTask({
     speechHandle,
     modelSettings: { toolChoice },
@@ -3011,7 +2964,7 @@ export class AgentActivity implements RecognitionHooks {
     // when force=true, we allow tool responses to bypass scheduling pause
     // This allows for tool responses to be generated before the AgentActivity is finalized
     if (this.schedulingPaused && !force) {
-      throw new SchedulingPausedError();
+      throw new Error('cannot schedule new speech, the speech scheduling is draining/pausing');
     }
 
     // Monotonic time to avoid near 0 collisions
@@ -3069,7 +3022,7 @@ export class AgentActivity implements RecognitionHooks {
         await this._closeSessionResources();
       } catch (error) {
         if (resources) {
-          await cleanupReusableResources(resources, this.logger);
+          await cleanupReusableResources(resources);
         }
         throw error;
       } finally {
@@ -3117,11 +3070,7 @@ export class AgentActivity implements RecognitionHooks {
 
       // detach after speech tasks are done but before _closeSessionResources
       if (newActivity) {
-        try {
-          return await this._detachReusableResources(newActivity);
-        } catch (error) {
-          this.logger.error(error, 'failed to detach reusable resources');
-        }
+        return await this._detachReusableResources(newActivity);
       }
       return undefined;
     } finally {

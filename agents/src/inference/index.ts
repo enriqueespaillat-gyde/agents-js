@@ -12,7 +12,6 @@ export {
   type GatewayOptions,
   type InferenceLLMOptions,
   type LLMModels,
-  type XAIModels,
 } from './llm.js';
 
 export {
@@ -25,8 +24,6 @@ export {
   type STTModels,
   type ModelWithLanguage as STTModelString,
   type STTOptions,
-  type XaiSTTModels,
-  type XaiOptions as XaiSTTOptions,
 } from './stt.js';
 
 export {

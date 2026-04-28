@@ -4,7 +4,6 @@
 import { Timestamp } from '@bufbuild/protobuf';
 import { AgentSession as pb } from '@livekit/protocol';
 import type { ByteStreamReader, Room, TextStreamInfo } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import type { TypedEventEmitter } from '@livekit/typed-emitter';
 import EventEmitter from 'events';
 import { TOPIC_SESSION_MESSAGES } from '../constants.js';
@@ -23,7 +22,6 @@ import type {
   TTSModelUsage,
 } from '../metrics/model_usage.js';
 import { Future, Task, shortuuid } from '../utils.js';
-import { version } from '../version.js';
 import type { AgentSession, AgentSessionUsage } from './agent_session.js';
 import {
   AgentSessionEventTypes,
@@ -199,7 +197,7 @@ export class RoomSessionTransport extends SessionTransport {
     return {
       next: (): Promise<IteratorResult<pb.AgentSessionMessage>> => {
         if (this.closed && this.pendingMessages.length === 0) {
-          return ThrowsPromise.resolve({
+          return Promise.resolve({
             value: undefined as unknown as pb.AgentSessionMessage,
             done: true,
           });
@@ -207,16 +205,16 @@ export class RoomSessionTransport extends SessionTransport {
 
         const pending = this.pendingMessages.shift();
         if (pending) {
-          return ThrowsPromise.resolve({ value: pending, done: false });
+          return Promise.resolve({ value: pending, done: false });
         }
 
-        return new ThrowsPromise<IteratorResult<pb.AgentSessionMessage>, never>((resolve) => {
+        return new Promise<IteratorResult<pb.AgentSessionMessage>>((resolve) => {
           this.waitingResolve = resolve;
         });
       },
       return: (): Promise<IteratorResult<pb.AgentSessionMessage>> => {
         this.close();
-        return ThrowsPromise.resolve({
+        return Promise.resolve({
           value: undefined as unknown as pb.AgentSessionMessage,
           done: true,
         });
@@ -442,13 +440,10 @@ function toolNames(toolCtx: ToolContext | undefined): string[] {
 }
 
 function protoSerializeOptions(opts: {
-  turnHandling?: {
-    endpointing?: unknown;
-    interruption?: unknown;
-    preemptiveGeneration?: unknown;
-  };
+  turnHandling?: { endpointing?: unknown; interruption?: unknown };
   maxToolSteps?: number;
   userAwayTimeout?: number | null;
+  preemptiveGeneration?: boolean;
   useTtsAlignedTranscript?: boolean;
 }): Record<string, string> {
   return {
@@ -456,7 +451,7 @@ function protoSerializeOptions(opts: {
     interruption: JSON.stringify(opts.turnHandling?.interruption ?? {}),
     max_tool_steps: String(opts.maxToolSteps ?? 0),
     user_away_timeout: String(opts.userAwayTimeout ?? ''),
-    preemptive_generation: JSON.stringify(opts.turnHandling?.preemptiveGeneration ?? {}),
+    preemptive_generation: String(opts.preemptiveGeneration ?? false),
     use_tts_aligned_transcript: String(opts.useTtsAlignedTranscript ?? false),
   };
 }
@@ -523,7 +518,7 @@ export class SessionHost {
       this.recvTask.cancel();
     }
 
-    await ThrowsPromise.allSettled([...this.tasks].map((task) => task.cancelAndWait()));
+    await Promise.allSettled([...this.tasks].map((task) => task.cancelAndWait()));
     this.tasks.clear();
 
     await this.transport.close();
@@ -729,14 +724,6 @@ export class SessionHost {
         });
       case 'getSessionUsage':
         return this.handleGetSessionUsage(req.requestId);
-      case 'getFrameworkInfo':
-        return this.sendResponse(req.requestId, {
-          case: 'getFrameworkInfo',
-          value: new pb.SessionResponse_GetFrameworkInfoResponse({
-            sdk: 'js',
-            sdkVersion: version,
-          }),
-        });
     }
   }
 
@@ -815,6 +802,7 @@ export class SessionHost {
           turnHandling: this.session!.sessionOptions.turnHandling,
           maxToolSteps: this.session!.sessionOptions.maxToolSteps,
           userAwayTimeout: this.session!.sessionOptions.userAwayTimeout,
+          preemptiveGeneration: this.session!.sessionOptions.preemptiveGeneration,
           useTtsAlignedTranscript: this.session!.sessionOptions.useTtsAlignedTranscript,
         }),
         createdAt: msToTimestamp(startedAt),

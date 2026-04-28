@@ -66,7 +66,6 @@ describe('pidusage on dead process', () => {
     const exitPromise = new Promise<void>((r) => child.on('exit', r));
 
     child.kill('SIGKILL');
-    await exitPromise;
 
     const results = await Promise.all([
       getChildMemoryUsageMB(pid),
@@ -74,6 +73,7 @@ describe('pidusage on dead process', () => {
       getChildMemoryUsageMB(pid),
     ]);
 
+    await exitPromise;
     expect(results.every((r) => r === 0)).toBe(true);
   });
 });

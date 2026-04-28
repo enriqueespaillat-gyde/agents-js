@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { TranscriptionSegment } from '@livekit/protocol';
 import { AudioFrame } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/promise';
-import type { Throws } from '@livekit/throws-transformer/throws';
 import type { TypedEventEmitter as TypedEmitter } from '@livekit/typed-emitter';
 import { EventEmitter } from 'node:events';
 import { basic } from './tokenize/index.js';
@@ -61,7 +59,7 @@ export class TextAudioSynchronizer extends (EventEmitter as new () => TypedEmitt
 
   #closed = false;
   #interrupted = false;
-  #closeFut = new Future<void, never>();
+  #closeFut = new Future();
 
   #playingSegIndex = -1;
   #finishedSegIndex = -1;
@@ -290,10 +288,10 @@ export class TextAudioSynchronizer extends (EventEmitter as new () => TypedEmitt
     textData.forwardedSentences++;
   }
 
-  async #sleepIfNotClosed(delay: number): Promise<Throws<void, never>> {
-    await ThrowsPromise.race([
+  async #sleepIfNotClosed(delay: number) {
+    await Promise.race([
       this.#closeFut.await,
-      new ThrowsPromise<void, never>((resolve) => setTimeout(resolve, delay)),
+      new Promise((resolve) => setTimeout(resolve, delay)),
     ]);
   }
 

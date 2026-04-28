@@ -7,12 +7,7 @@ import * as llm from '../llm/index.js';
 import type { APIConnectOptions } from '../types.js';
 import { DEFAULT_API_CONNECT_OPTIONS } from '../types.js';
 import { type Expand, toError } from '../utils.js';
-import {
-  type AnyString,
-  buildMetadataHeaders,
-  createAccessToken,
-  getDefaultInferenceUrl,
-} from './utils.js';
+import { type AnyString, createAccessToken, getDefaultInferenceUrl } from './utils.js';
 
 export type OpenAIModels =
   | 'openai/gpt-5.4'
@@ -44,13 +39,6 @@ export type MoonshotModels = 'moonshotai/kimi-k2-instruct';
 
 export type DeepSeekModels = 'deepseek-ai/deepseek-v3' | 'deepseek-ai/deepseek-v3.2';
 
-export type XAIModels =
-  | 'xai/grok-4-1-fast-non-reasoning'
-  | 'xai/grok-4-1-fast-reasoning'
-  | 'xai/grok-4.20-0309-non-reasoning'
-  | 'xai/grok-4.20-0309-reasoning'
-  | 'xai/grok-4.20-multi-agent-0309';
-
 type ChatCompletionPredictionContentParam =
   Expand<OpenAI.Chat.Completions.ChatCompletionPredictionContent>;
 type WebSearchOptions = Expand<OpenAI.Chat.Completions.ChatCompletionCreateParams.WebSearchOptions>;
@@ -70,7 +58,6 @@ export interface ChatCompletionOptions extends Record<string, unknown> {
   prediction?: ChatCompletionPredictionContentParam | null;
   presence_penalty?: number;
   prompt_cache_key?: string;
-  prompt_cache_retention?: 'in_memory' | '24h';
   reasoning_effort?: 'minimal' | 'low' | 'medium' | 'high';
   safety_identifier?: string;
   seed?: number;
@@ -90,65 +77,7 @@ export interface ChatCompletionOptions extends Record<string, unknown> {
   // response_format?: OpenAI.Chat.Completions.ChatCompletionCreateParams['response_format']
 }
 
-export type LLMModels =
-  | OpenAIModels
-  | GoogleModels
-  | MoonshotModels
-  | DeepSeekModels
-  | XAIModels
-  | AnyString;
-
-const REASONING_UNSUPPORTED_PARAMS = new Set([
-  'temperature',
-  'top_p',
-  'presence_penalty',
-  'frequency_penalty',
-  'logit_bias',
-  'logprobs',
-  'top_logprobs',
-  'n',
-]);
-
-const XAI_REASONING_UNSUPPORTED_PARAMS = new Set(['presence_penalty', 'frequency_penalty', 'stop']);
-
-const UNSUPPORTED_PARAMS: Record<string, Set<string>> = {
-  o1: REASONING_UNSUPPORTED_PARAMS,
-  o3: REASONING_UNSUPPORTED_PARAMS,
-  o4: REASONING_UNSUPPORTED_PARAMS,
-  'gpt-5': REASONING_UNSUPPORTED_PARAMS,
-  'grok-4-1-fast-reasoning': XAI_REASONING_UNSUPPORTED_PARAMS,
-  'grok-4.20-0309-reasoning': XAI_REASONING_UNSUPPORTED_PARAMS,
-  'grok-4.20-multi-agent': XAI_REASONING_UNSUPPORTED_PARAMS,
-};
-
-const REASONING_EFFORT_TOOL_INCOMPATIBLE_PREFIXES = new Set(['gpt-5.2', 'gpt-5.4']);
-
-function dropUnsupportedParams(
-  model: string,
-  params: Record<string, unknown>,
-  tools?: unknown[],
-): Record<string, unknown> {
-  const modelName = model.includes('/') ? model.split('/').pop()! : model;
-  let result = { ...params };
-
-  for (const [prefix, unsupported] of Object.entries(UNSUPPORTED_PARAMS)) {
-    if (modelName.startsWith(prefix)) {
-      result = Object.fromEntries(Object.entries(result).filter(([k]) => !unsupported.has(k)));
-      break;
-    }
-  }
-
-  if (
-    tools &&
-    tools.length > 0 &&
-    Array.from(REASONING_EFFORT_TOOL_INCOMPATIBLE_PREFIXES).some((p) => modelName.startsWith(p))
-  ) {
-    const { reasoning_effort: _, ...rest } = result;
-    result = rest;
-  }
-
-  return result;
-}
+export type LLMModels = OpenAIModels | GoogleModels | MoonshotModels | DeepSeekModels | AnyString;
 
 export interface InferenceLLMOptions {
   model: LLMModels;
@@ -381,11 +310,7 @@ export class LLMStream extends llm.LLMStream {
           })
         : undefined;
 
-      const requestOptions: Record<string, unknown> = dropUnsupportedParams(
-        this.model,
-        { ...this.modelOptions },
-        tools,
-      );
+      const requestOptions: Record<string, unknown> = { ...this.modelOptions };
       if (!tools) {
         delete requestOptions.tool_choice;
       }
@@ -398,14 +323,13 @@ export class LLMStream extends llm.LLMStream {
         );
       }
 
-      const extraHeaders: Record<string, string> = {
-        ...buildMetadataHeaders(),
-        ...((requestOptions.extra_headers as Record<string, string> | undefined) ?? {}),
-      };
       if (this.provider) {
+        const extraHeaders = requestOptions.extra_headers
+          ? (requestOptions.extra_headers as Record<string, string>)
+          : {};
         extraHeaders['X-LiveKit-Inference-Provider'] = this.provider;
+        requestOptions.extra_headers = extraHeaders;
       }
-      delete requestOptions.extra_headers;
 
       const stream = await this.client.chat.completions.create(
         {
@@ -417,15 +341,10 @@ export class LLMStream extends llm.LLMStream {
           ...requestOptions,
         },
         {
-          headers: extraHeaders,
           timeout: this.connOptions.timeoutMs,
           signal: this.abortController.signal,
         },
       );
-
-      if (this.abortController.signal.aborted) {
-        return;
-      }
 
       for await (const chunk of stream) {
         if (this.abortController.signal.aborted) {
@@ -455,10 +374,6 @@ export class LLMStream extends llm.LLMStream {
         }
       }
     } catch (error) {
-      if (this.abortController.signal.aborted) {
-        return;
-      }
-
       if (error instanceof OpenAI.APIConnectionTimeoutError) {
         throw new APITimeoutError({ options: { retryable } });
       } else if (error instanceof OpenAI.APIError) {

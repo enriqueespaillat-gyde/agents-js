@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import type { AudioFrame } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import type { TypedEventEmitter as TypedEmitter } from '@livekit/typed-emitter';
 import type { Span } from '@opentelemetry/api';
 import { EventEmitter } from 'node:events';
@@ -205,24 +204,7 @@ export abstract class SynthesizeStream
     // is run **after** the constructor has finished. Otherwise we get
     // runtime error when trying to access class variables in the
     // `run` method.
-    // Ensure `this.output` is closed once mainTask settles, even when
-    // `monitorMetrics` never started (no `pushText` was ever called).
-    // Without this, consumers iterating the stream hang forever.
-    startSoon(async () => {
-      try {
-        await this.mainTask();
-      } catch {
-        // already surfaced via emitError; swallow to avoid unhandled rejection.
-      } finally {
-        this.queue.close();
-        if (this.#monitorMetricsTask) {
-          await this.#monitorMetricsTask.catch(() => {});
-        }
-        if (!this.output.closed) {
-          this.output.close();
-        }
-      }
-    });
+    startSoon(() => this.mainTask().finally(() => this.queue.close()));
   }
 
   private _mainTaskImpl = async (span: Span) => {
@@ -525,7 +507,7 @@ export abstract class ChunkedStream implements AsyncIterableIterator<Synthesized
     // is run **after** the constructor has finished. Otherwise we get
     // runtime error when trying to access class variables in the
     // `run` method.
-    ThrowsPromise.resolve().then(() => this.mainTask().finally(() => this.queue.close()));
+    Promise.resolve().then(() => this.mainTask().finally(() => this.queue.close()));
   }
 
   private _mainTaskImpl = async (span: Span) => {

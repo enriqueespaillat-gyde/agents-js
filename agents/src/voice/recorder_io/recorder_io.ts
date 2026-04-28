@@ -352,8 +352,6 @@ export class RecorderIO {
     } finally {
       inReader.releaseLock();
       outReader.releaseLock();
-      this.inResampler?.close();
-      this.outResampler?.close();
 
       if (!this.closeFuture.done) {
         this.closeFuture.resolve();

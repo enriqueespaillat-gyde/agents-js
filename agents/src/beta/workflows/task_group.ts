@@ -4,7 +4,6 @@
 import { z } from 'zod';
 import type { ChatContext } from '../../llm/chat_context.js';
 import { LLM, ToolError, ToolFlag, tool } from '../../llm/index.js';
-import { asError } from '../../utils.js';
 import { AgentTask } from '../../voice/agent.js';
 
 interface FactoryInfo {
@@ -115,7 +114,7 @@ export class TaskGroup extends AgentTask<TaskGroupResult> {
           taskResults[taskId] = e;
           continue;
         } else {
-          this.complete(asError(e));
+          this.complete(e instanceof Error ? e : new Error(String(e)));
           return;
         }
       }

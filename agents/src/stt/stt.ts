@@ -62,20 +62,6 @@ export interface SpeechData {
   confidence: number;
   /** Word-level timing information. */
   words?: TimedString[];
-  /** Speaker identifier when the provider supports diarization. */
-  speakerId?: string | null;
-  /**
-   * The source languages spoken by the user.
-   *
-   * Populated by STT services that support translation, where `language` holds the
-   * target language and `sourceLanguages` holds the original spoken language(s),
-   * or by multi-language detection services where `language` holds the dominant
-   * language and `sourceLanguages` holds all detected languages sorted by prevalence.
-   *
-   * May contain multiple entries when a single utterance spans multiple source languages.
-   */
-  // Ref: python livekit-agents/livekit/agents/stt/stt.py - 62-68 lines
-  sourceLanguages?: LanguageCode[];
 }
 
 export interface RecognitionUsage {
@@ -111,8 +97,6 @@ export interface STTCapabilities {
    * - false: Provider does not support aligned transcripts
    */
   alignedTranscript?: 'word' | 'chunk' | false;
-  /** Whether this STT supports speaker diarization. */
-  diarization?: boolean;
 }
 
 export interface STTError {
@@ -147,10 +131,6 @@ export abstract class STT extends (EventEmitter as new () => TypedEmitter<STTCal
   /** Returns this STT's capabilities */
   get capabilities(): STTCapabilities {
     return this.#capabilities;
-  }
-
-  protected updateCapabilities(caps: Partial<STTCapabilities>): void {
-    this.#capabilities = { ...this.#capabilities, ...caps };
   }
 
   /**
@@ -281,14 +261,6 @@ export abstract class SpeechStream implements AsyncIterableIterator<SpeechEvent>
       try {
         return await this.run();
       } catch (error) {
-        // If the stream was intentionally aborted (e.g. session shutdown), exit
-        // silently. Downstream listeners may already be detached by this point,
-        // and emitting an `error` event here would trigger ERR_UNHANDLED_ERROR
-        // in Node's EventEmitter.
-        if (this.abortController.signal.aborted) {
-          return;
-        }
-
         if (error instanceof APIError) {
           const retryInterval = intervalForRetry(this._connOptions, i);
 
@@ -473,7 +445,6 @@ export abstract class SpeechStream implements AsyncIterableIterator<SpeechEvent>
     if (!this.queue.closed) this.queue.close();
     if (!this.output.closed) this.output.close();
     if (!this.abortController.signal.aborted) this.abortController.abort();
-    this.resampler?.close();
     this.closed = true;
   }
 

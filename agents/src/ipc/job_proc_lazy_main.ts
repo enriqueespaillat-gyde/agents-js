@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import { Room, RoomEvent, dispose } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import { EventEmitter, once } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import type { Logger } from 'pino';
@@ -41,11 +40,9 @@ type JobTask = {
 };
 
 class PendingInference {
-  promise = new ThrowsPromise<{ requestId: string; data: unknown; error?: Error }, never>(
-    (resolve) => {
-      this.resolve = resolve; // this is how JavaScript lets you resolve promises externally
-    },
-  );
+  promise = new Promise<{ requestId: string; data: unknown; error?: Error }>((resolve) => {
+    this.resolve = resolve; // this is how JavaScript lets you resolve promises externally
+  });
   resolve(arg: { requestId: string; data: unknown; error?: Error }) {
     arg; // useless call to counteract TypeScript E6133
   }
@@ -129,12 +126,6 @@ const startJob = (
     }, 10000);
 
     try {
-      const closePromise = once(closeEvent, 'close').then((close) => {
-        logger.debug('shutting down');
-        shutdown = true;
-        safeSend({ case: 'exiting', value: { reason: close[1] } });
-      });
-
       // Run the job function within the AsyncLocalStorage context
       await runWithJobContextAsync(ctx, async () => {
         const { tracer, traceTypes } = await import('../telemetry/index.js');
@@ -147,15 +138,15 @@ const startJob = (
           },
           { name: 'job_entrypoint' },
         );
-      })
-        .then(async () => {
-          if (!shutdown) {
-            await closePromise;
-          }
-        })
-        .finally(async () => {
-          clearTimeout(unconnectedTimeout);
-        });
+      }).finally(() => {
+        clearTimeout(unconnectedTimeout);
+      });
+
+      await once(closeEvent, 'close').then((close) => {
+        logger.debug('shutting down');
+        shutdown = true;
+        safeSend({ case: 'exiting', value: { reason: close[1] } });
+      });
     } catch (error) {
       logger.error({ error }, 'error in entry function');
       shutdown = true;
@@ -180,7 +171,7 @@ const startJob = (
     for (const callback of ctx.shutdownCallbacks) {
       shutdownTasks.push(callback());
     }
-    await ThrowsPromise.all(shutdownTasks).catch((error) =>
+    await Promise.all(shutdownTasks).catch((error) =>
       logger.error({ error }, 'error while shutting down the job'),
     );
 
