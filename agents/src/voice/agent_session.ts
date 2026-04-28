@@ -759,16 +759,17 @@ export class AgentSession<
 
     this._globalRunState = runState;
 
-    // Defer generateReply through the activityLock to ensure any in-progress
-    // activity transition (e.g. AgentTask started from onEnter) completes first.
-    // TS Task.from starts onEnter synchronously, so the transition may already be
-    // mid-flight by the time run() is called after session.start() resolves.
-    // Acquiring and immediately releasing the lock guarantees FIFO ordering:
-    // the transition's lock section finishes before we route generateReply.
+    // Drain the activity lock until the bootstrap chain settles. TaskGroup
+    // triggers a chain of _updateActivity calls (Agent → TaskGroup → ChildTask),
+    // each holding the lock. A single acquire only waits for the first. Loop
+    // until the activity stabilises (no change between two consecutive acquires).
     (async () => {
       try {
-        const unlock = await this.activityLock.lock();
-        unlock();
+        let prevActivity: AgentActivity | undefined;
+        do {
+          prevActivity = this.activity;
+          (await this.activityLock.lock())();
+        } while (this.activity !== prevActivity);
         this.generateReply({ userInput });
       } catch (e) {
         runState._reject(asError(e));

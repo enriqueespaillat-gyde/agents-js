@@ -228,7 +228,14 @@ export class RunResult<T = unknown> {
 
     const allDone = [...this.handles].every((h) => (isSpeechHandle(h) ? h.done() : h.done));
     if (allDone) {
-      this._markDone();
+      // Defer by one microtask so in-flight AgentTask finally blocks can add
+      // new handles (e.g. resumeTransitionTask) before we resolve.
+      const countBefore = this.handles.size;
+      Promise.resolve().then(() => {
+        if (this.doneFut.done) return;
+        if (this.handles.size !== countBefore) return;
+        this._markDone();
+      });
     }
   }
 
